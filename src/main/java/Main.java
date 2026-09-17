@@ -27,28 +27,33 @@ public class Main {
             return;
         }
 
+        long t = System.currentTimeMillis();
 
-        Instance inst = new Instance();
-        inst.initData("Scholl/Scholl_1/N1C1W1_C.txt");
+        for (File f : files) {
+            Instance inst = new Instance();
+            inst.initData(f.getAbsolutePath());
 
-        System.out.println("=== Bin Packing — Branch and Price (Java + CPLEX) ===");
-        System.out.println(inst);
-        System.out.println("连续下界 ceil(总重/容量) = "
-                + (int) Math.ceil(inst.totalWeight() / inst.capacity - 1e-9));
+            System.out.println("=== Bin Packing — Branch and Price (Java + CPLEX) ===");
+            System.out.println("算例: " + f.getName());
+            System.out.println(inst);
+            System.out.println("连续下界 ceil(总重/容量) = "
+                    + (int) Math.ceil(inst.totalWeight() / inst.capacity - 1e-9));
 
-        long t0 = System.currentTimeMillis();
-        BranchAndPrice.Result result = new BranchAndPrice(inst).solve(inst);
-        long ms = System.currentTimeMillis() - t0;
+            long t0 = System.currentTimeMillis();
+            BranchAndPrice.Result result = new BranchAndPrice(inst).solve(inst);
+            long ms = System.currentTimeMillis() - t0;
 
-        System.out.println();
-        System.out.println("FFD 贪心上界   : " + result.ffdBound);
-        System.out.println("根节点 LP 下界 : " + result.rootLpBound);
-        System.out.println("最优箱子数     : " + result.bins);
-        System.out.println("B&P 搜索节点数 : " + result.nodes);
-        System.out.println("耗时           : " + ms + " ms");
-        System.out.println("---------------------------------");
+            System.out.println();
+            System.out.println("FFD 贪心上界   : " + result.ffdBound);
+            System.out.println("根节点 LP 下界 : " + result.rootLpBound);
+            System.out.println("最优箱子数     : " + result.bins);
+            System.out.println("B&P 搜索节点数 : " + result.nodes);
+            System.out.println("耗时           : " + ms + " ms");
+            System.out.println("---------------------------------");
+        }
         //System.out.println("最优装箱方案:");
        // printBins(result.solution, inst.weights, inst.capacity);
+        System.out.println("总时长" + (System.currentTimeMillis() - t) + " ms");
     }
 
     private static void printBins(List<Set<Integer>> bins, double[] weights, double capacity) {

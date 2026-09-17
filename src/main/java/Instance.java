@@ -42,6 +42,7 @@ public class Instance {
             int n = Integer.parseInt(line);
             capacity = Integer.parseInt(br.readLine());
             weights = new double[n];
+            //原始物品索引的重量
             for (int i = 0; i < n; i++) {
                 weights[i] = Double.parseDouble(br.readLine());
             }

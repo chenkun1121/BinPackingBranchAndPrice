@@ -41,6 +41,7 @@ public final class PricingProblem {
             cplex.setOut(null);
             IloNumVar[] x = cplex.boolVarArray(n);
             // IloNumExpr obj = cplex.numExpr();
+            //重新使用 scalProd 计算目标函数和约束，建立定价问题模型
             cplex.addMaximize(cplex.scalProd(x, pi));
             double[] weights = items.stream().mapToDouble(e -> e.weight).toArray();
             cplex.addLe(cplex.scalProd(x, weights), capacity);
@@ -65,6 +66,7 @@ public final class PricingProblem {
             }
             List<Integer> pattern = new ArrayList<>();
             for (int e = 0; e < n; e++) {
+                // 检查变量 x[e] 的值是否大于 0.5，如果是，则将该有效物品的下标 e 添加到模式中
                 if (cplex.getValue(x[e]) > 0.5) pattern.add(e);
             }
             int[] result = new int[pattern.size()];

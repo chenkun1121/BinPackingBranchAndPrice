@@ -47,10 +47,36 @@ s.t. Σ_i w_i x_i ≤ C
 |---|---|
 | `Instance.java` | 问题实例（物品重量、容量） |
 | `EffItem.java` | 有效物品（together 分支合并后的物品组） |
+| `Node.java` | **分支定界树节点**：局部约束（有效物品 + 冲突对）、继承列池、LP 下界、分支决策 |
 | `MasterProblem.java` | 受限主问题 RMP（CPLEX LP，动态加列，取对偶） |
 | `PricingProblem.java` | 定价子问题（CPLEX 背包 MILP，含冲突约束） |
-| `BranchAndPrice.java` | 搜索框架：列生成 + 剪枝 + Ryan-Foster 分支 + FFD 初始上界 |
+| `BranchAndPrice.java` | 搜索框架：节点栈 DFS + 列生成 + 剪枝 + Ryan-Foster 分支 + FFD 初始上界 |
 | `Main.java` | 演示算例入口 |
+
+### 节点（Node）
+
+每个节点封装一次"列生成求解 + 分支"的完整上下文：
+
+```
+parent / children      父指针与子节点列表（构成搜索树）
+no / depth             节点编号与深度
+items                  有效物品列表（together 分支把被绑定物品合并成一个 EffItem）
+cfc                    冲突对（separate 分支累积，定价问题据此加 x_a + x_b <= 1）
+columns                列池：父节点传下来的列 + 本节点生成的列（warm start）
+y / lb / n_lp          各列 LP 取值 / 节点下界 / 列生成迭代次数
+last_branch            分支历史："a+b" 表示同箱，"a|b" 表示分箱
+status / branchPair    节点状态 / 选出的 Ryan-Foster 分支对
+```
+
+子节点由构造器 `new Node(inst, parent, a, b, anb)` 生成，内部自动完成：
+
+- **together（anb = true）**：合并 a、b 为一个有效物品（物品数减一），
+  冲突对与列池按下标重映射（含 a 或 b 但不同时含二者的列被剔除）；
+  若超容量或与已有 separate 决策矛盾，则 `isFeasible() == false`，不入栈。
+- **separate（anb = false）**：冲突对追加 (a,b)，列池中同时含 a、b 的列被剔除。
+
+搜索框架只需维护一个 `Deque<Node>`：push/pop 即深度优先，
+换成按下界排序的 `PriorityQueue` 即最佳优先，其余求解逻辑不变。
 
 ## 运行
 
