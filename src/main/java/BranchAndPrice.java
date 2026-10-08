@@ -25,18 +25,37 @@ public class BranchAndPrice {
     private static final double EPS = 1e-6;
     /** 是否打印每个节点的 LP 解向量（调试用）。 */
     private static final boolean VERBOSE = false;
+    /**
+     * 自检开关：每个节点列生成结束后，逐列验证"激活列都满足本节点的分支约束"。
+     * 正常求解时关闭（有额外开销）；排查列池复用相关问题时打开。
+     */
+    private static final boolean VERIFY = false;
 
+    private final Instance inst;
     private final double capacity;
     private double incumbent = Double.MAX_VALUE;   // 当前最优箱子数（上界）
     private List<Set<Integer>> bestBins;           // 当前最优装箱方案
     private double rootLpBound = -1;
+    private int ffdBound;                          // FFD 贪心给出的初始上界
 
     private int processedNodes = 0;                // 已求解的节点数
     private int generatedNodes = 0;                // 已生成的节点总数（含根）
  //   private final Map<Node.Status, Integer> stats = new EnumMap<>(Node.Status.class);
+    /** 全树唯一的 CPLEX 环境：构造时建一次，所有节点复用，不再逐节点重建。 */
+    public  MasterProblem master;
+    public  Node root;
 
-    public BranchAndPrice(Instance inst) {
+    public BranchAndPrice(Instance inst)  throws IloException {
+        this.inst = inst;
         this.capacity = inst.capacity;
+        // 注意：建的是"原始物品数"条覆盖约束，不是 capacity 条
+        master = new MasterProblem(inst.n());
+    }
+
+    /** 释放 CPLEX 环境（主问题 + 定价子问题）。 */
+    public void close() {
+        if (master != null) master.close();
+        PricingProblem.shutdown();
     }
 
     /** 求解结果。 */
@@ -66,123 +85,166 @@ public class BranchAndPrice {
         }
     }
 
+    /**
+     * 初始列与初始上界（只影响列池，不重建模型）：
+     *   1. FFD 贪心的每个箱子转成一列 —— 给 RMP 一个接近最优的起点，减少列生成迭代；
+     *   2. 每个原始物品的单物品列 —— 保证 RMP 在任何节点都可行，列生成得以冷启动。
+     *
+     * 列一律以"原始物品下标"表示，根节点上有效物品与原始物品一一对应。
+     */
+    public void init() throws IloException {
+        List<Set<Integer>> ffd = firstFitDecreasing(inst);
+        ffdBound = ffd.size();
+        incumbent = ffdBound;
+        bestBins = ffd;
+        System.out.println("FFD 贪心上界: " + incumbent);
+        for (Set<Integer> bin : ffd) {
+            int[] item = new int[bin.size()];
+            int idx = 0;
+            for (int it : bin) {
+                item[idx++] = it;
+            }
+            master.addColumn(item);
+        }
+        for (int o = 0; o < inst.n(); o++) {
+            master.addColumn(new int[]{o});
+        }
+    }
+
+
     // ==================================================================
     //                          主循环
     // ==================================================================
 
-    public Result solve(Instance inst) throws IloException {
-        // ---- 初始上界：FFD 贪心 ----
-        List<Set<Integer>> ffd = firstFitDecreasing(inst);
-        incumbent = ffd.size();
-        bestBins = ffd;
-        System.out.println("FFD 贪心上界: " + incumbent);
+    public Result solve() throws IloException {
+        init();                                   // 初始列 + FFD 上界（只灌列，不重建模型）
+        try {
+            // ---- 根节点 ----
+            Node.cnt = 0;
+            root = new Node(inst);
+            generatedNodes = 1;
 
-        // ---- 根节点 ----
-        Node.cnt = 0;
-        Node root = new Node(inst);
-        generatedNodes = 1;
+            // ---- 显式搜索树：DFS（后进先出） ----
+            Deque<Node> open = new ArrayDeque<>();
+            open.push(root);
 
-        // ---- 显式搜索树：DFS（后进先出） ----
-        Deque<Node> open = new ArrayDeque<>();
-        open.push(root);
+            while (!open.isEmpty()) {
+                Node node = open.pop();
+                processedNodes++;
 
-        while (!open.isEmpty()) {
-            Node node = open.pop();
-            processedNodes++;
+                // ========== 阶段 1：列生成，求节点 LP 下界 ==========
+                solveNodeLp(node);
+                if (node.status == Node.Status.INFEASIBLE) {     // RMP 不可行 -> 剪枝
+                    // tally(Node.Status.INFEASIBLE);
+                    continue;
+                }
+                if (node.isRootNode()) rootLpBound = node.lb;
+              //  logNode(node);
 
-            // ========== 阶段 1：列生成，求节点 LP 下界 ==========
-            solveNodeLp(node);
-            if (node.status == Node.Status.INFEASIBLE) {     // RMP 不可行 -> 剪枝
-                // tally(Node.Status.INFEASIBLE);
-                continue;
+                // ========== 阶段 2：剪枝（LP 下界取整后不小于当前上界） ==========
+                if (Math.ceil(node.lb - 1e-4) >= incumbent - EPS) {
+                    node.status = Node.Status.PRUNED;
+                   // tally(Node.Status.PRUNED);
+                    continue;
+                }
+
+                // ========== 阶段 3：整数性判定 / Ryan-Foster 选分支对 ==========
+                int[] pair = chooseBranchPair(node);
+                if (pair == null) {                              // LP 解已是整数解
+                    updateIncumbent(node);
+                    node.status = Node.Status.INTEGER;
+                  //  tally(Node.Status.INTEGER);
+                    continue;
+                }
+
+                // ========== 阶段 4：分支 ==========
+                node.branchPair = pair;
+                node.status = Node.Status.BRANCHED;
+              //  tally(Node.Status.BRANCHED);
+
+                Node sep = new Node(inst, node, pair[0], pair[1], false);
+                Node tog = new Node(inst, node, pair[0], pair[1], true);
+
+                // DFS 先探 together 分支：栈后进先出，故 separate 先入栈
+                open.push(sep);
+                if (tog.isFeasible()) open.push(tog);
             }
-            if (node.isRootNode()) rootLpBound = node.lb;
-            logNode(node);
 
-            // ========== 阶段 2：剪枝（LP 下界取整后不小于当前上界） ==========
-            if (Math.ceil(node.lb - 1e-4) >= incumbent - EPS) {
-                node.status = Node.Status.PRUNED;
-               // tally(Node.Status.PRUNED);
-                continue;
-            }
-
-            // ========== 阶段 3：整数性判定 / Ryan-Foster 选分支对 ==========
-            int[] pair = chooseBranchPair(node.y, node.columns);
-            if (pair == null) {                              // LP 解已是整数解
-                updateIncumbent(node);
-                node.status = Node.Status.INTEGER;
-              //  tally(Node.Status.INTEGER);
-                continue;
-            }
-
-            // ========== 阶段 4：分支 ==========
-            node.branchPair = pair;
-            node.status = Node.Status.BRANCHED;
-          //  tally(Node.Status.BRANCHED);
-
-            Node sep = new Node(inst, node, pair[0], pair[1], false);
-            Node tog = new Node(inst, node, pair[0], pair[1], true);
-
-            // DFS 先探 together 分支：栈后进先出，故 separate 先入栈
-            open.push(sep);
-            if (tog.isFeasible()) open.push(tog);
+            generatedNodes = Node.cnt;      // 含因超容量/矛盾而未入栈的 together 子节点
+         //   printSummary();
+            return new Result((int) incumbent, bestBins, processedNodes,
+                    rootLpBound, ffdBound, generatedNodes, true);
+        } finally {
+            close();                        // 释放唯一的 CPLEX 环境
         }
-
-        generatedNodes = Node.cnt;          // 含因超容量/矛盾而未入栈的 together 子节点
-     //   printSummary();
-        return new Result((int) incumbent, bestBins, processedNodes,
-                rootLpBound, ffd.size(), generatedNodes, true);
     }
 
     /**
      * 在给定节点上运行列生成（RMP <-> Pricing 交替），结果写回节点。
      *
-     * 先用节点继承的列池 warm start：子节点生成时已做过相容性过滤与下标重映射，
-     * 池中列都是本节点的合法模式；再补单物品列以保证 RMP 始终可行。
+     * 【复用全局模型】不再逐节点 new 一个 MasterProblem，而是：
+     *   1. setNode(node::isColumnValid) —— 按本节点的 together/separate 约束，
+     *      把非法列的变量上界设 0、合法的放开（只改 UB，不动模型结构）；
+     *   2. 补"每个有效物品单独一箱"的兜底列 —— 恒满足本节点约束，保证 RMP 可行；
+     *   3. 列生成循环：定价返回的是**有效物品下标**，需先聚合成"原始物品下标"
+     *      再入全局列池（池中的列语义必须全树一致，才能跨节点复用）；
+     *      相应地，RMP 的对偶 π 是原始物品层面的，传入定价前要按 EffItem 聚合。
      */
     private void solveNodeLp(Node node) throws IloException {
-        // 表示一个节点中的有效物品集合，及其对应的 LP 列池（模式）和 LP 取值
-        ArrayList<EffItem> items = node.items;
-        try (MasterProblem master = new MasterProblem(items.size())) {
-            Set<String> seen = new HashSet<>();
+        // 1) 节点切换：屏蔽本节点非法的列、放开合法的列
+        master.setNode(node::isColumnValid);
 
-            // 1) warm start：继承父节点的列
-            //TODO: 对于这里的模型的创建过程，是不是可以在节点处就创建好模型，然后在这里再添加列，而不是每次都重新创建模型？
+        // 2) 兜底列：每个有效物品单独装一箱。必定满足 together（整组进箱）与
+        //    separate（每箱仅一组），因此 RMP 恒可行，列生成得以冷启动。
+        for (int e = 0; e < node.items.size(); e++) {
+            master.addColumn(node.origPatternOf(e));
+        }
+        master.setNode(node::isColumnValid);   // 新加的列也要按本节点再判定一次
+
+        // 3) 列生成：不断追加 reduced cost < 0 的列，直到没有改进列
+        while (true) {
+            double[] piOrig = master.solve();          // 原始物品层面的对偶价格
+            node.n_lp++;
+            if (piOrig == null) {                      // RMP 不可行
+                node.status = Node.Status.INFEASIBLE;
+                return;
+            }
+            double[] piEff = node.effDuals(piOrig);    // 聚合到有效物品层面
+            int[] local = PricingProblem.solve(node.items, node.cfc, piEff, capacity);
+            if (local == null) break;                  // 无负 reduced cost -> 收敛
+
+            int[] orig = node.toOrigPattern(local);    // 有效物品下标 -> 原始物品下标
+            if (master.containsColumn(orig)) break;    // 重复列：兜底防死循环
+            master.addColumn(orig);
+        }
+
+        node.lb = master.objectiveValue();
+
+        // 只把本节点激活的列及其 LP 取值写回节点（供分支决策与整数解还原）
+        int[] active = master.activeColumnIndices();
+        double[] all = master.columnValues();
+        node.columns = new ArrayList<>(active.length);
+        node.y = new double[active.length];
+        for (int i = 0; i < active.length; i++) {
+            node.columns.add(master.getColumn(active[i]).clone());
+            node.y[i] = all[active[i]];
+        }
+        node.status = Node.Status.SOLVED;
+
+        // 自检：本节点激活的每一列都必须满足本节点的 together/separate 约束
+        if (VERIFY) {
             for (int[] col : node.columns) {
-                if (seen.add(Node.columnKey(col))){
-                    master.addColumn(col);
+                if (!node.isColumnValid(col)) {
+                    throw new IllegalStateException("节点 #" + node.no + " 出现非法列 "
+                            + Arrays.toString(col) + "，分支路径 " + node.getBranchPath());
                 }
             }
-            // 2) 单物品列：保证 RMP 可行且覆盖所有物品
-            for (int e = 0; e < items.size(); e++) {
-                int[] single = new int[]{e};
-                if (seen.add(Node.columnKey(single))) master.addColumn(single);
-            }
+        }
 
-            // 3) 列生成：不断追加 reduced cost < 0 的列，直到没有改进列
-            while (true) {
-                double[] pi = master.solve();
-                node.n_lp++;
-                if (pi == null) {                            // RMP 不可行
-                    node.status = Node.Status.INFEASIBLE;
-                    return;
-                }
-                int[] pattern = PricingProblem.solve(items, node.cfc, pi, capacity);
-                if (pattern == null) break;                  // 无负 reduced cost -> 收敛
-                if (!seen.add(Node.columnKey(pattern))) break; // 重复列（兜底防死循环）
-                master.addColumn(pattern);
-            }
-
-            node.lb = master.objectiveValue();
-            node.y = master.columnValues();
-            node.columns = new ArrayList<>(master.getColumns()); // 回写列池供子节点复用
-            node.status = Node.Status.SOLVED;
-
-            //当前节点的 LP 解向量和列数打印出来，便于调试和分析
-            if (VERBOSE) {
-                System.out.println("  LP solution: " + Arrays.toString(node.y));
-                System.out.println("  columns    : " + node.columns.size());
-            }
+        //当前节点的 LP 解向量和列数打印出来，便于调试和分析
+        if (VERBOSE) {
+            System.out.println("  LP solution: " + Arrays.toString(node.y));
+            System.out.println("  columns    : " + node.columns.size());
         }
     }
 
@@ -191,16 +253,21 @@ public class BranchAndPrice {
      * 对每个分数列 s（0 < y_s < 1）中出现的物品对 (i,j)，累加 f_ij = sum_{s>= {i,j}} y_s。
      * 若存在 0 < f_ij < 1 则选其分支；若所有 f_ij 均为 0/1，则 LP 解必为整数解
      * （Ryan-Foster 定理）。选取 f_ij 最接近 0.5 的对以平衡分支树。
+     *
+     * 注意：全局列池中的列用"原始物品下标"表示，而分支对必须是"有效物品下标"
+     * （together 合并后的组才是一个分支单位），故先经 node.toEffPattern 映射。
      */
-    private int[] chooseBranchPair(double[] y, List<int[]> cols) {
+    private int[] chooseBranchPair(Node node) {
+        double[] y = node.y;
+        List<int[]> cols = node.columns;
         Map<Long, Double> f = new HashMap<>();
         for (int s = 0; s < cols.size(); s++) {
             if (y[s] <= EPS || y[s] >= 1.0 - EPS) continue;  // 只看分数列
-            int[] col = cols.get(s);                          // 模式 s 包含的有效物品下标
-            //对于模式 s 中的每一对物品 (a,b)，累加 f_ij
-            for (int a = 0; a < col.length; a++) {
-                for (int b = a + 1; b < col.length; b++) {
-                    f.merge(pairKey(col[a], col[b]), y[s], Double::sum);
+            int[] eff = node.toEffPattern(cols.get(s));      // 原始物品 -> 有效物品下标
+            //对于模式 s 中的每一对有效物品 (a,b)，累加 f_ij
+            for (int a = 0; a < eff.length; a++) {
+                for (int b = a + 1; b < eff.length; b++) {
+                    f.merge(pairKey(eff[a], eff[b]), y[s], Double::sum);
                 }
             }
         }
@@ -224,11 +291,11 @@ public class BranchAndPrice {
     /** LP 解整时把它转成可行装箱方案并尝试更新上界。 */
     private void updateIncumbent(Node node) {
         List<Set<Integer>> bins = new ArrayList<>();
-        // 每个取值 >= 1 的列对应一个箱子，列中有效物品展开成原始物品
+        // 每个取值 >= 1 的列对应一个箱子；列已是原始物品下标，直接成箱
         for (int s = 0; s < node.columns.size(); s++) {
             if (node.y[s] < 1.0 - EPS) continue;
             Set<Integer> bin = new TreeSet<>();
-            for (int e : node.columns.get(s)) bin.addAll(node.items.get(e).origItems);
+            for (int o : node.columns.get(s)) bin.add(o);
             bins.add(bin);
         }
         // 去重：同一物品出现在多个箱子时归入第一个箱子，再删掉空箱
@@ -254,7 +321,7 @@ public class BranchAndPrice {
     // ==================================================================
 
     private void logNode(Node node) {
-        System.out.printf("节点 #%-3d depth=%-2d LP=%-9.4f ceil(LP)=%-3d 上界=%.0f  列数=%-4d %s%n",
+        System.out.printf("节点 #%-3d depth=%-2d LP=%-9.4f ceil(L P)=%-3d 上界=%.0f  列数=%-4d %s%n",
                 node.no, node.depth, node.lb,
                 (int) Math.ceil(node.lb - 1e-4), incumbent,
                 node.columns.size(), node.getBranchPath());

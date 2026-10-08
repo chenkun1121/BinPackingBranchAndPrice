@@ -16,7 +16,7 @@ public class Main {
      //   int capacity = 10;
        // double[] weights = {3, 3, 3, 3, 4, 4, 8, 8, 8, 8, 8};
 
-        File file = new File("Scholl/Scholl_1");
+        File file = new File("Scholl/Scholl_3");
         if (!file.exists()) {
             System.out.println("文件夹不存在: " + file.getAbsolutePath());
             return;
@@ -40,7 +40,7 @@ public class Main {
                     + (int) Math.ceil(inst.totalWeight() / inst.capacity - 1e-9));
 
             long t0 = System.currentTimeMillis();
-            BranchAndPrice.Result result = new BranchAndPrice(inst).solve(inst);
+            BranchAndPrice.Result result = new BranchAndPrice(inst).solve();
             long ms = System.currentTimeMillis() - t0;
 
             System.out.println();

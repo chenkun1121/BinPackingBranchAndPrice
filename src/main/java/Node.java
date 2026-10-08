@@ -1,3 +1,6 @@
+import ilog.concert.IloException;
+import ilog.cplex.IloCplex;
+
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
@@ -59,9 +62,15 @@ public class Node {
     public Status status;
     public boolean feasible;                // together 分支矛盾或超容量时为 false
 
+
     private HashMap<Integer, BitSet> incompatible;//快速查询与i不同箱的有效物品集合
+    /** 原始物品总数（全树固定，不随 together 合并而变）。 */
+    private final int numOrig;
+    /** 原始物品 -> 有效物品下标的映射表，items 定稿后构建。 */
+    private int[] origToEff;
+
     /** 根节点：每个原始物品自成一个有效物品，无冲突约束、空列池。 */
-    public Node(Instance inst) {
+    public Node(Instance inst) throws IloException {
         this.no = Node.cnt++;
         this.parent = null;
         this.depth = 0;
@@ -72,9 +81,11 @@ public class Node {
         this.columns = new ArrayList<>();
         this.status = Status.NEW;
         this.feasible = true;
+        this.numOrig = inst.n();
         for (int i = 0; i < inst.n(); i++) {
             items.add(new EffItem(inst.weights[i], new TreeSet<>(Set.of(i))));
         }
+        rebuildOrigToEff();
     }
 
     /**
@@ -84,7 +95,7 @@ public class Node {
      * @param a,b  分支的有效物品下标
      * @param anb  true = a、b 必须同箱（together）；false = a、b 必须分箱（separate）
      */
-    public Node(Instance inst, Node parent, int a, int b, boolean anb) {
+    public Node(Instance inst, Node parent, int a, int b, boolean anb) throws IloException {
         this.parent = parent;
         this.no = Node.cnt++;
         this.depth = parent.depth + 1;
@@ -96,6 +107,8 @@ public class Node {
         this.columns = new ArrayList<>();
         this.status = Status.NEW;
         this.feasible = true;
+        this.numOrig = parent.numOrig;
+        // 列池不再逐节点复制：由 MasterProblem 全局持有，模式用原始物品下标表示
 
         if (a > b) {                        // ensure a <= b
             int tmp = b;
@@ -110,6 +123,7 @@ public class Node {
             last_branch.add(0, a + "|" + b);
             buildSeparate(parent, a, b);
         }
+        rebuildOrigToEff();                  // items 定稿后再建映射
         parent.children.add(this);
     }
 
@@ -117,7 +131,7 @@ public class Node {
     // ------------------------------------------------------------------
     //                        together 分支 (a+b)
     // ------------------------------------------------------------------
-    private void buildTogether(Instance inst, Node parent, int a, int b) {
+    private void buildTogether(Instance inst, Node parent, int a, int b) throws IloException {
         // 与已有的 separate 决策矛盾
         for (int[] p : parent.cfc) {
             if (p[0] == a && p[1] == b) {
@@ -157,22 +171,8 @@ public class Node {
             int z = remap[p[1]];
             if (x != z) cfc.add(new int[]{Math.min(x, z), Math.max(x, z)});
         }
-
-        // 列池重映射：含 a 或 b 但不同时含二者的列违反 together，剔除
-        for (int[] col : parent.columns) {
-            boolean ha = false, hb = false;
-            for (int e : col) {
-                if (e == a) ha = true;
-                else if (e == b) hb = true;
-            }
-            if (ha != hb) continue;
-            TreeSet<Integer> set = new TreeSet<>();
-            for (int e : col) set.add(remap[e]);
-            int[] nc = new int[set.size()];
-            int s = 0;
-            for (int e : set) nc[s++] = e;
-            columns.add(nc);
-        }
+        // 列池不再随节点复制 / 重映射：列池由 MasterProblem 全局持有，
+        // 模式一律以"原始物品下标"表示，节点切换靠变量上界屏蔽（见 MasterProblem.setNode）。
     }
 
     // ------------------------------------------------------------------
@@ -182,17 +182,7 @@ public class Node {
         items.addAll(parent.items);
         cfc.addAll(parent.cfc);
         cfc.add(new int[]{a, b});
-
-        // 同时含 a、b 的列违反新冲突约束，剔除
-        for (int[] col : parent.columns) {
-            boolean ha = false, hb = false;
-            for (int e : col) {
-                if (e == a) ha = true;
-                else if (e == b) hb = true;
-            }
-            if (ha && hb) continue;
-            columns.add(col.clone());
-        }
+        // 同上：列池不再逐节点复制，交给 MasterProblem.setNode 屏蔽。
     }
 
     // ------------------------------------------------------------------
@@ -206,6 +196,108 @@ public class Node {
     /** together 分支是否可行（未超容量、未与既有冲突约束矛盾）。 */
     public boolean isFeasible() {
         return feasible;
+    }
+
+    // ------------------------------------------------------------------
+    //          全局列池下的节点视图（列一律用"原始物品下标"表示）
+    // ------------------------------------------------------------------
+
+    /**
+     * 判定一个模式（原始物品下标）在本节点是否合法。这是 {@code MasterProblem.setNode}
+     * 用来屏蔽 / 放开列的谓词，对应 Ryan-Foster 的两类分支约束：
+     *
+     *   1) together：每个有效物品必须"整组进箱或整组不进"，不允许只取其中一部分原始物品；
+     *   2) separate：模式不得同时包含某个冲突对两端的有效物品。
+     */
+    public boolean isColumnValid(int[] origPattern) {
+        BitSet b = new BitSet();
+        for (int o : origPattern) b.set(o);
+
+        // 1) together：整块判定（0 < 命中数 < 组大小 即为非法）
+        for (EffItem e : items) {
+            int cnt = 0;
+            for (int o : e.origItems) {
+                if (b.get(o)) cnt++;
+            }
+            if (cnt > 0 && cnt < e.origItems.size()) return false;
+        }
+
+        // 2) separate：冲突对两端不得同时出现在模式中
+        for (int[] p : cfc) {
+            if (hits(b, items.get(p[0])) && hits(b, items.get(p[1]))) return false;
+        }
+        return true;
+    }
+
+    /** 模式是否命中该有效物品（含其任一原始物品即算命中）。 */
+    private static boolean hits(BitSet b, EffItem e) {
+        for (int o : e.origItems) {
+            if (b.get(o)) return true;
+        }
+        return false;
+    }
+
+    /** 把定价子问题返回的"有效物品下标"模式展开成"原始物品下标"。 */
+    public int[] toOrigPattern(int[] localPattern) {
+        TreeSet<Integer> orig = new TreeSet<>();
+        for (int e : localPattern) {
+            orig.addAll(items.get(e).origItems);
+        }
+        int[] r = new int[orig.size()];
+        int k = 0;
+        for (int o : orig) r[k++] = o;
+        return r;
+    }
+
+    /** 第 e 个有效物品对应的原始物品下标数组（用于构造"单组一箱"的兜底列）。 */
+    public int[] origPatternOf(int effIndex) {
+        Set<Integer> s = items.get(effIndex).origItems;
+        int[] r = new int[s.size()];
+        int k = 0;
+        for (int o : s) r[k++] = o;      // origItems 是 TreeSet，天然升序
+        return r;
+    }
+
+    /** 重建"原始物品 -> 有效物品下标"映射。items 每次定稿后调用。 */
+    private void rebuildOrigToEff() {
+        origToEff = new int[numOrig];
+        Arrays.fill(origToEff, -1);
+        for (int e = 0; e < items.size(); e++) {
+            for (int o : items.get(e).origItems) origToEff[o] = e;
+        }
+    }
+
+    /**
+     * 把"原始物品下标"模式映射回本节点的"有效物品下标"模式（去重、升序）。
+     * 分支决策必须在有效物品层面进行——together 合并后的组才是一个不可分割的单位，
+     * 对组内某个原始物品单独分支会破坏分支的正确性。
+     */
+    public int[] toEffPattern(int[] origPattern) {
+        TreeSet<Integer> eff = new TreeSet<>();
+        for (int o : origPattern) {
+            int e = origToEff[o];
+            if (e >= 0) eff.add(e);
+        }
+        int[] r = new int[eff.size()];
+        int k = 0;
+        for (int e : eff) r[k++] = e;
+        return r;
+    }
+
+    /**
+     * 把 RMP 的"原始物品"对偶价格 π 聚合到本节点的"有效物品"层面。
+     * together 分支把若干原始物品绑定成一个有效物品，它们必须同进同出，
+     * 因此在定价子问题看来该有效物品的价值等于其成员对偶之和：
+     *      π_eff(e) = Σ_{o ∈ e.origItems} π_o
+     */
+    public double[] effDuals(double[] origPi) {
+        double[] piEff = new double[items.size()];
+        for (int e = 0; e < items.size(); e++) {
+            double s = 0;
+            for (int o : items.get(e).origItems) s += origPi[o];
+            piEff[e] = s;
+        }
+        return piEff;
     }
 
     public ArrayList<Node> getChildren() {
